@@ -70,20 +70,31 @@
     (str base "/_matrix/" api "/v" version "/"
          (str/join "/" (map to-component components)))))
 
+(defn- get-token-issuer! [domain]
+  (-> (exec-request! {:url    (str "https://" domain "/.well-known/matrix/openid")
+                      :method :get
+                      :accept :json})
+      :token-issuer))
+
+(defn- get-client-id! [domain]
+  (-> (exec-request! {:url    (str "https://" domain "/.well-known/matrix/openid")
+                      :method :get
+                      :accept :json})
+      :client-id))
+
 (defn- get-wellknown-url! [domain]
-  (->
-      (exec-request! {:url          (str "https://" domain "/.well-known/matrix/client")
-                      :method       :get
-                      :accept       :json})
+  (-> (exec-request! {:url    (str "https://" domain "/.well-known/matrix/client")
+                      :method :get
+                      :accept :json})
       :m.homeserver
       :base_url))
 
-(defn get-jwt-token! [& {:keys [provider-url client-id username password]}]
-  (-> (exec-request! {:url     provider-url
+(defn get-jwt-token! [& {:keys [domain username password]}]
+  (-> (exec-request! {:url     (get-token-issuer! provider-url)
                       :method  :post
                       :accept  :json
                       :form-params {:grant_type "client_credentials"
-                                    :client_id  client-id
+                                    :client_id  (get-client-id! client-id)
                                     :username   username
                                     :password   password}})
       :access_token))
