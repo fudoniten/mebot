@@ -4,14 +4,20 @@
             [clojure.pprint :refer [pprint]]
             [clojure.string :as str]
             [clojure.java.io :as io]
-            [camel-snake-kebab.core :refer [->kebab-case]])
+            [clojure.core.async :refer [>! <! chan go-loop timeout pipeline]]
+            [camel-snake-kebab.core :refer [->kebab-case]]
+            [slingshot.slingshot :refer [try+ throw+]])
   (:import java.net.InetAddress
            java.net.URLEncoder
            java.net.URI
            java.util.UUID
-           org.apache.tika.Tika))
+           org.apache.tika.Tika
+           clojure.lang.ExceptionInfo))
 
-(defn pthru [o] (pprint o) o)
+(defn pthru [o]
+  (pprint o)
+  (flush)
+  o)
 
 (defmulti decode-body :content-type)
 (defmethod decode-body :json [res]
@@ -26,42 +32,25 @@
 (defmulti exec-request! :method)
 (defmethod exec-request! :get
   [& {:keys [url accept] :as opts}]
-  (-> (pthru url)
+  (-> url
       (http/get opts)
       (assoc :content-type accept)
       (decode-body)))
 (defmethod exec-request! :post
   [& {:keys [url accept] :as opts}]
-  (-> (pthru url)
+  (-> url
       (http/post (encode-body opts))
       (assoc :content-type accept)
       (decode-body)))
 (defmethod exec-request! :put
   [& {:keys [url accept] :as opts}]
-  (-> (pthru url)
+  (-> url
       (http/put (encode-body opts))
       (assoc :content-type accept)
       (decode-body)))
 (defmethod exec-request! :default
   [& {:keys [method]}]
   (throw (RuntimeException. (str  "Bad method: " method))))
-
-(defn- put-bytes!
-  ([url]      (put-bytes! url {}))
-  ([url opts] (-> url
-                  (http/put (-> opts
-                                (update :accept       (fn [_] :json))
-                                (update :content-type (fn [_] :json))))
-                  :body
-                  (json/read-str :key-fn keyword))))
-
-(defn- put-multipart!
-  ([url]      (put-multipart! url {}))
-  ([url opts] (-> url
-                  (http/put (-> opts
-                                (update :accept       (fn [_] :json))))
-                  :body
-                  (json/read-str :key-fn keyword))))
 
 (defn- matrix-url
   [base components & {:keys [api version]
@@ -90,11 +79,11 @@
       :base_url))
 
 (defn get-jwt-token! [& {:keys [domain username password]}]
-  (-> (exec-request! {:url     (get-token-issuer! provider-url)
+  (-> (exec-request! {:url     (str (get-token-issuer! domain) "/")
                       :method  :post
                       :accept  :json
                       :form-params {:grant_type "client_credentials"
-                                    :client_id  (get-client-id! client-id)
+                                    :client_id  (get-client-id! domain)
                                     :username   username
                                     :password   password}})
       :access_token))
@@ -167,15 +156,33 @@
 (defn- assoc-if-present [m k v]
   (if v (assoc m k v) m))
 
+(defn- make-room [client room-id]
+  { :client client :room-id room-id })
+
 (defn create-private-room! [client & {:keys [name alias topic invitees]
                                       :or   {invitees []}}]
-  (post! client [:createRoom]
-         {:content-type :json
-          :body         (-> {:preset "private_chat"}
-                            (assoc-if-present :name   name)
-                            (assoc-if-present :alias  alias)
-                            (assoc-if-present :topic  topic)
-                            (assoc            :invite invitees))}))
+  (->> (post! client [:createRoom]
+              {:content-type :json
+               :body         (-> {:preset "private_chat"}
+                                 (assoc-if-present :name   name)
+                                 (assoc-if-present :alias  alias)
+                                 (assoc-if-present :topic  topic)
+                                 (assoc            :invite invitees))})
+       :room_id
+       (make-room client)))
+
+(defn join-public-room! [client & {:keys [alias]}]
+  (try
+    (->> (post! client [:join alias]
+                {:content-type :json
+                 :body         {:reason "mabel client joining"}})
+         (pthru)
+         :room_id
+         (make-room client))
+    (catch ExceptionInfo e
+      (let [info (ex-info e)]
+        (if (= (:status info) 403)
+          (throw+ {:type ::forbidden :room-alias alias} e))))))
 
 (defn get-room-members! [client room-id]
   (get! client [:rooms room-id :members]))
@@ -191,14 +198,61 @@
   (get! client [:rooms room-id :messages]
         {:query-params {:dir "b"}}))
 
+(defn get-current-event-stamp! [client]
+  (-> (get! client [:sync]) :next_batch))
+
 (defn get-room-messages! [client room-id]
-  (->> (get-room-events! client room-id)
+  (->> (get! client [:rooms room-id :messages]
+             {:query-params {:dir "b"}})
        :chunk
        (filter is-message?)))
+
+(defn get-room-events-from! [client room-id from]
+  (get! client [:rooms room-id :messages]
+        {:query-params {:dir "b" :from from}}))
+
+(defn room-event-channel!
+  ([room] (room-event-channel! room {}))
+  ([{:keys [room-id client]}
+    {:keys [buffer poll-freq]
+     :or   {buffer    5
+            poll-freq 5}}]
+   (let [evt-chan (chan buffer)
+         seen-messages (atom #{})]
+     (go-loop [response (get-room-events-from! client room-id
+                                               (get-current-event-stamp! client))]
+       (doseq [{:keys [event_id] :as evt} (:chunk response)]
+         (when (not (contains? @seen-messages event_id))
+           (swap! seen-messages conj event_id)
+           (>! evt-chan evt)))
+       (<! (timeout (* poll-freq 1000)))
+       (recur (get-room-events-from! client room-id (:end response))))
+     evt-chan)))
+
+(defn- parallelism []
+  (-> (Runtime/getRuntime)
+      (.availableProcessors)
+      (+ 1)))
+
+(defn pipe [in xf]
+  (let [out (chan)]
+    (pipeline (parallelism) out xf in)
+    out))
+
+(defn room-message-channel! [& args]
+  (pipe (apply room-event-channel! args)
+        (filter is-message?)))
+
+(defn room-self-mention-channel! [{{:keys [user-id]} :client :as room} & rest]
+  (pipe (apply room-message-channel! (cons room rest))
+        (filter (partial mentions? user-id))))
 
 (defn get-room-mentions! [client room-id user]
   (filter (partial mentions? user)
           (get-room-messages! client room-id)))
+
+(defn get-room-self-mentions! [{:keys [user-id] :as client} room-id]
+  (get-room-mentions! client room-id user-id))
 
 (defn send-message! [client room-id msg]
   (let [txn-id (str (UUID/randomUUID))]
@@ -237,3 +291,15 @@
                     :url     (str media-uri)}
              :accept       :json
              :content-type :json}))))
+
+(defn room-message! [{:keys [client room-id]} msg]
+  (send-message! client room-id msg))
+
+(defn room-image! [{:keys [client room-id]} bytes filename]
+  (send-image! client room-id bytes filename))
+
+(defn room-mentions! [{:keys [client room-id]} user]
+  (get-room-mentions! client room-id user))
+
+(defn room-self-mentions! [{:keys [room-id client]}]
+  (get-room-self-mentions! client room-id))
