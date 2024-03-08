@@ -14,6 +14,8 @@
            org.apache.tika.Tika
            clojure.lang.ExceptionInfo))
 
+;; Matrix Client
+
 (defn pthru [o]
   (pprint o)
   (flush)
