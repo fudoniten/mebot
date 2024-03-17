@@ -18,7 +18,6 @@
           default = mebot;
           mebot = helpers.packages."${system}".mkClojureLib {
             name = "org.fudo/mebot";
-            primaryNamespace = "mebot.core";
             src = ./.;
             buildCommand = "clojure -T:build uberjar";
           };
