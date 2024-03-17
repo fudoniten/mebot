@@ -20,6 +20,7 @@
             name = "org.fudo/mebot";
             primaryNamespace = "mebot.core";
             src = ./.;
+            buildCommand = "clojure -T:build uberjar";
           };
         };
 
