@@ -19,7 +19,6 @@
           mebot = helpers.packages."${system}".mkClojureLib {
             name = "org.fudo/mebot";
             src = ./.;
-            buildCommand = "clojure -T:build uberjar";
           };
         };
 
