@@ -7,8 +7,4 @@
         org.apache.tika/tika-core { :mvn/version "2.9.1" }
         org.clojure/core.async { :mvn/version "1.6.681" }
         }
-  :aliases {
-           :build {:deps {io.github.clojure/tools.build { :mvn/version "0.10.0" }}
-                   :ns-default build }
-           }
  }
