@@ -26,7 +26,7 @@
           default = updateDeps;
           updateDeps = pkgs.mkShell {
             buildInputs = with helpers.packages."${system}";
-              [ updateClojureDeps ];
+              [ (updateClojureDeps { }) ];
           };
         };
       });
